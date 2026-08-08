@@ -3,21 +3,28 @@
      * system24 unrounding — squares off Discord mobile's rounded corners.
      *
      * The desktop theme does this with one CSS rule (`* { border-radius: 0 }`,
-     * see src/unrounding.css upstream). Mobile has no CSS, so radii have to be
-     * removed from React Native style objects instead. Three layers, in order of
-     * coverage:
+     * see src/unrounding.css upstream). Mobile has no CSS, so corners have to be
+     * taken away at four different places, because Discord rounds things in four
+     * different ways:
      *
-     *   1. Sweep Metro's module registry and zero every radius on every style
-     *      object that already exists, in place. Mutating in place means
-     *      components holding a reference pick it up on their next render, with
-     *      no re-render cost and no wrapper components.
-     *   2. Patch `StyleSheet.create` so style objects created later (Discord
-     *      builds most screens' styles lazily, on first navigation) get the same
-     *      treatment.
-     *   3. Optionally patch the JSX runtime to strip radii from inline `style`
-     *      props. Off by default: it runs on every element creation.
+     *   1. REGISTRY SWEEP — walk Metro's module registry and zero every radius
+     *      on every style object that already exists, in place. Cheap, and
+     *      components holding a reference pick it up on their next render.
+     *      Misses anything whose styles live in a closure rather than on module
+     *      exports, which is most of Discord's design system.
+     *   2. StyleSheet.create — catches stylesheets built after startup (Discord
+     *      builds most screens' styles lazily, on first navigation).
+     *   3. ELEMENT PROPS — patch the JSX runtime and `React.createElement` and
+     *      strip radii from the `style` prop of every element. This is the
+     *      catch-all: however a radius was authored, it arrives here. Design
+     *      system components (option groups, cards, buttons) need this one.
+     *   4. MASKS — avatars and server icons aren't rounded by `borderRadius` at
+     *      all; they're masked, so no amount of style stripping touches them.
+     *      This drops `mask`/`clipPath` props, zeroes SVG `rx`/`ry`, and swaps
+     *      MaskedView for a plain View that renders its children unmasked.
      *
-     * Everything layer 1 touches is recorded so `onUnload` can put it back.
+     * Everything layers 1 and 2 touch is recorded, so `onUnload` puts it back.
+     * Layers 3 and 4 are pure patches and simply stop applying.
      *
      * NOTE: the loader evals this file as `vendetta=>{return <file>}`, so the
      * file must *start* with the expression — a leading comment would put a line
@@ -27,12 +34,12 @@
 
     const { patcher, metro, storage: storageApi, ui, logger } = vendetta;
     const { React, ReactNative } = metro.common;
-    const { StyleSheet, ScrollView } = ReactNative;
+    const { StyleSheet, ScrollView, View } = ReactNative;
     const { showToast } = ui.toasts;
     const store = vendetta.plugin.storage;
 
     /* React Native's full set of corner-radius style props */
-    const RADIUS_KEYS = new Set([
+    const RADIUS_KEYS = [
         'borderRadius',
         'borderTopLeftRadius',
         'borderTopRightRadius',
@@ -46,10 +53,14 @@
         'borderStartEndRadius',
         'borderEndStartRadius',
         'borderEndEndRadius',
-    ]);
+    ];
+    const RADIUS_KEY_SET = new Set(RADIUS_KEYS);
 
     /* Discord's design tokens keep their radii in objects under these keys */
     const TOKEN_KEYS = new Set(['radii', 'radius', 'borderRadii']);
+
+    /* Props that mask an element into a shape instead of rounding it */
+    const MASK_PROPS = ['mask', 'clipPath'];
 
     /* A radius this large is a pill or a circle, not a panel corner */
     const CIRCLE_THRESHOLD = 100;
@@ -58,13 +69,37 @@
     const MAX_VISITS = 400000;
     const MAX_UNDO = 50000;
 
-    if (typeof store.keepCircles !== 'boolean') store.keepCircles = false;
-    if (typeof store.patchInlineStyles !== 'boolean') store.patchInlineStyles = false;
+    /* Bumped when defaults change, so an existing install picks them up */
+    const CONFIG_VERSION = 2;
+    if (store.configVersion !== CONFIG_VERSION) {
+        store.keepCircles = store.keepCircles === true;
+        store.stripElementStyles = true;
+        store.squareMasks = true;
+        store.configVersion = CONFIG_VERSION;
+        /* v1's name for what is now stripElementStyles, and it defaulted off */
+        if ('patchInlineStyles' in store) delete store.patchInlineStyles;
+    }
 
     /** Recorded mutations: [object, key, originalValue]. */
     let undoLog = [];
     let unpatches = [];
     let visits = 0;
+
+    /** Memoized style stripping, so repeat renders don't re-clone. */
+    let styleCache = new WeakMap();
+
+    let stats = {};
+    const resetStats = () => {
+        stats = {
+            modules: 0,
+            sweptValues: 0,
+            styleProps: 0,
+            masksDropped: 0,
+            maskedViews: 0,
+            hooks: [],
+        };
+    };
+    resetStats();
 
     /* ── zeroing ──────────────────────────────────────────────────────── */
 
@@ -79,9 +114,11 @@
         return false;
     }
 
+    const zeroFor = (value) => (typeof value === 'string' ? '0%' : 0);
+
     function setZero(object, key, value) {
         try {
-            object[key] = typeof value === 'string' ? '0%' : 0;
+            object[key] = zeroFor(value);
         } catch {
             return; /* frozen or getter-only; nothing to undo */
         }
@@ -136,7 +173,7 @@
                 continue;
             }
 
-            if (RADIUS_KEYS.has(key)) {
+            if (RADIUS_KEY_SET.has(key)) {
                 if (isZeroableRadius(value)) setZero(node, key, value);
             } else if (TOKEN_KEYS.has(key)) {
                 zeroTokenObject(value);
@@ -151,7 +188,6 @@
         const modules = metro.modules;
         const seen = new WeakSet();
         visits = 0;
-        let scanned = 0;
 
         for (const id in modules) {
             const module = modules[id];
@@ -168,17 +204,22 @@
             if (!exports || exports === globalThis) continue;
 
             sweep(exports, 0, seen);
-            scanned++;
+            stats.modules++;
         }
 
-        return { scanned, changed: undoLog.length };
+        stats.sweptValues = undoLog.length;
     }
 
-    /* ── inline styles (optional layer 3) ─────────────────────────────── */
+    /* ── layer 3/4: element props ─────────────────────────────────────── */
 
-    /** Copy-on-write: only allocates when the style actually carries a radius. */
+    /** Copy-on-write, memoized: only allocates when there is a radius to remove. */
     function stripStyle(style) {
         if (!style || typeof style !== 'object') return style;
+
+        const cached = styleCache.get(style);
+        if (cached !== undefined) return cached;
+
+        let result = style;
 
         if (Array.isArray(style)) {
             let changed = false;
@@ -187,50 +228,138 @@
                 if (stripped !== entry) changed = true;
                 return stripped;
             });
-            return changed ? next : style;
+            if (changed) result = next;
+        } else {
+            let clone = null;
+            for (const key of RADIUS_KEYS) {
+                const value = style[key];
+                if (value === undefined || !isZeroableRadius(value)) continue;
+                if (!clone) clone = Object.assign({}, style);
+                clone[key] = zeroFor(value);
+            }
+            if (clone) result = clone;
         }
 
-        let clone = null;
-        for (const key of RADIUS_KEYS) {
-            if (!(key in style)) continue;
-            const value = style[key];
-            if (!isZeroableRadius(value)) continue;
-            if (!clone) clone = Object.assign({}, style);
-            clone[key] = typeof value === 'string' ? '0%' : 0;
-        }
-        return clone || style;
+        /* caching the identity result matters as much as caching the clone: it
+           turns every later render of an unrounded style into one map lookup */
+        styleCache.set(style, result);
+        return result;
     }
 
-    function patchInlineStyles() {
-        const runtime = metro.findByProps('jsx', 'jsxs');
-        if (!runtime) {
-            logger.warn('could not find the JSX runtime; inline styles left alone');
-            return;
+    /**
+     * Rewrite an element's props. Returns the same object when there is nothing
+     * to change, so React's identity checks are unaffected.
+     */
+    function transformProps(props) {
+        if (!props || typeof props !== 'object') return props;
+
+        let next = props;
+        const edit = () => {
+            if (next === props) next = Object.assign({}, props);
+            return next;
+        };
+
+        if (store.stripElementStyles && props.style) {
+            const stripped = stripStyle(props.style);
+            if (stripped !== props.style) {
+                edit().style = stripped;
+                stats.styleProps++;
+            }
         }
 
-        for (const name of ['jsx', 'jsxs']) {
-            if (typeof runtime[name] !== 'function') continue;
+        if (store.squareMasks && !store.keepCircles) {
+            for (const key of MASK_PROPS) {
+                if (props[key] === undefined || props[key] === null) continue;
+                delete edit()[key];
+                stats.masksDropped++;
+            }
+            /* rounded corners of an SVG <Rect>, which is how a squircle mask is
+               usually drawn */
+            for (const key of ['rx', 'ry']) {
+                const value = props[key];
+                if (value === undefined || value === null || value === 0) continue;
+                edit()[key] = 0;
+            }
+        }
+
+        return next;
+    }
+
+    /** Renders MaskedView's children with no mask applied. */
+    function UnmaskedView(props) {
+        return React.createElement(View, { style: props.style }, props.children);
+    }
+
+    /** MaskedView is what gives avatars their status-notch cutout. */
+    function findMaskedView() {
+        const attempts = [
+            () => metro.findByName('MaskedView'),
+            () => metro.findByDisplayName('MaskedView'),
+            () => {
+                const module = metro.findByProps('MaskedViewIOS');
+                return module && module.MaskedViewIOS;
+            },
+        ];
+
+        for (const attempt of attempts) {
+            try {
+                const found = attempt();
+                if (typeof found === 'function' || (found && typeof found === 'object')) {
+                    return found;
+                }
+            } catch {
+                /* finder threw; try the next one */
+            }
+        }
+        return null;
+    }
+
+    function patchElementCreation() {
+        const maskedView = store.squareMasks ? findMaskedView() : null;
+        if (store.squareMasks) {
+            stats.hooks.push(maskedView ? 'MaskedView found' : 'MaskedView NOT found');
+        }
+
+        const rewrite = (args) => {
+            if (maskedView && args[0] === maskedView) {
+                args[0] = UnmaskedView;
+                stats.maskedViews++;
+            }
+            const props = transformProps(args[1]);
+            if (props !== args[1]) args[1] = props;
+            return args;
+        };
+
+        /* the automatic JSX runtime, which is what Discord's bundle compiles to */
+        const runtime = metro.findByProps('jsx', 'jsxs');
+        if (runtime) {
+            for (const name of ['jsx', 'jsxs']) {
+                if (typeof runtime[name] !== 'function') continue;
+                unpatches.push(
+                    patcher.instead(name, runtime, (args, original) => original(...rewrite(args)))
+                );
+                stats.hooks.push(name);
+            }
+        } else {
+            logger.warn('JSX runtime not found');
+        }
+
+        /* the classic runtime, still used by plugins and older screens */
+        if (React && typeof React.createElement === 'function') {
             unpatches.push(
-                patcher.instead(name, runtime, (args, original) => {
-                    const props = args[1];
-                    if (props && props.style) {
-                        const stripped = stripStyle(props.style);
-                        /* props may be frozen, so replace rather than mutate */
-                        if (stripped !== props.style) {
-                            args[1] = Object.assign({}, props, { style: stripped });
-                        }
-                    }
-                    return original(...args);
-                })
+                patcher.instead('createElement', React, (args, original) => original(...rewrite(args)))
             );
+            stats.hooks.push('createElement');
         }
     }
 
     /* ── lifecycle ────────────────────────────────────────────────────── */
 
     function apply() {
-        const { scanned, changed } = sweepRegistry();
-        logger.log(`unrounded ${changed} values across ${scanned} modules`);
+        resetStats();
+        styleCache = new WeakMap();
+
+        sweepRegistry();
 
         /* Layer 2: anything created from here on */
         unpatches.push(
@@ -245,9 +374,13 @@
             })
         );
 
-        if (store.patchInlineStyles) patchInlineStyles();
+        if (store.stripElementStyles || store.squareMasks) patchElementCreation();
 
-        return { scanned, changed };
+        logger.log(
+            `swept ${stats.sweptValues} radii across ${stats.modules} modules; hooks: ${
+                stats.hooks.join(', ') || 'none'
+            }`
+        );
     }
 
     function revert() {
@@ -259,6 +392,7 @@
             }
         }
         unpatches = [];
+        styleCache = new WeakMap();
 
         /* restore in reverse so repeated writes to one key land back on the
            value it had before this plugin ever touched it */
@@ -273,48 +407,71 @@
         undoLog = [];
     }
 
+    function reapply() {
+        revert();
+        apply();
+    }
+
     /* ── settings ─────────────────────────────────────────────────────── */
 
     function Settings() {
         const { FormSwitchRow, FormRow, FormDivider } = ui.components.Forms;
         storageApi.useProxy(store);
 
-        const restart = (label) => {
-            revert();
-            const { changed } = apply();
-            showToast(`${label} · ${changed} values unrounded`);
+        const toggle = (key, label) => (value) => {
+            store[key] = value;
+            reapply();
+            showToast(label);
         };
 
         return React.createElement(
             ScrollView,
             null,
             React.createElement(FormSwitchRow, {
-                label: 'Keep circles and pills round',
+                label: 'Square masked shapes',
                 subLabel:
-                    'Leave radii of 100 or more alone, so avatars and pill buttons stay round. system24 squares these too.',
-                value: store.keepCircles,
-                onValueChange: (value) => {
-                    store.keepCircles = value;
-                    restart(value ? 'Circles kept round' : 'Everything squared');
-                },
+                    'Avatars and server icons are masked, not rounded, so this is what squares them. Turn off if a gradient or overlay looks wrong.',
+                value: store.squareMasks,
+                onValueChange: toggle('squareMasks', 'Masks updated · reload to apply fully'),
             }),
             React.createElement(FormDivider, null),
             React.createElement(FormSwitchRow, {
-                label: 'Also strip inline styles',
+                label: 'Square design system components',
                 subLabel:
-                    'Catches radii written directly in JSX instead of a stylesheet. More thorough, but runs on every element created.',
-                value: store.patchInlineStyles,
-                onValueChange: (value) => {
-                    store.patchInlineStyles = value;
-                    restart(value ? 'Inline styles patched' : 'Inline patch removed');
-                },
+                    'Strips radii from every element as it renders. Needed for option groups, cards and buttons, whose styles a sweep cannot reach.',
+                value: store.stripElementStyles,
+                onValueChange: toggle('stripElementStyles', 'Element styles updated'),
+            }),
+            React.createElement(FormDivider, null),
+            React.createElement(FormSwitchRow, {
+                label: 'Keep circles and pills round',
+                subLabel:
+                    'Leaves radii of 100 or more alone and keeps masks intact, so avatars stay round. system24 squares these too.',
+                value: store.keepCircles,
+                onValueChange: toggle('keepCircles', 'Circle handling updated'),
             }),
             React.createElement(FormDivider, null),
             React.createElement(FormRow, {
                 label: 'Re-run now',
+                subLabel: 'Sweeps screens opened since the plugin started.',
+                onPress: () => {
+                    reapply();
+                    showToast(`${stats.sweptValues} radii swept`);
+                },
+            }),
+            React.createElement(FormDivider, null),
+            React.createElement(FormRow, {
+                label: 'Show what it hooked',
                 subLabel:
-                    'Sweeps screens that have been opened since the plugin started. Reloading Discord is the thorough option.',
-                onPress: () => restart('Swept again'),
+                    'If something is still round, this says which mechanisms were found — useful in a bug report.',
+                onPress: () => {
+                    const summary =
+                        `hooks: ${stats.hooks.join(', ') || 'none'} · ` +
+                        `${stats.sweptValues} swept · ${stats.styleProps} style props · ` +
+                        `${stats.masksDropped} masks · ${stats.maskedViews} MaskedViews`;
+                    logger.log(summary);
+                    showToast(summary);
+                },
             })
         );
     }

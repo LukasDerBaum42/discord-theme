@@ -71,26 +71,42 @@ feature from themes:
 Then reload Discord. Screens already rendered keep their old corners until they re-render, which is
 why a reload is the reliable way to see it.
 
-How it works, since mobile has no `* { border-radius: 0 }`:
+Mobile has no `* { border-radius: 0 }`, and Discord rounds things in four different ways, so there
+are four layers:
 
 1. **Registry sweep** — walks Metro's module registry and zeroes every radius on every style object
    that already exists, in place. In-place mutation means components holding a reference pick it up
-   on their next render, with no wrapper components and no re-render cost.
+   on their next render, with no wrapper components and no re-render cost. Misses anything whose
+   styles live in a closure rather than on module exports — which is most of the design system.
 2. **`StyleSheet.create` patch** — Discord builds most screens' styles lazily on first navigation, so
    anything created after startup gets the same treatment.
-3. **Inline styles** (off by default) — patches the JSX runtime to strip radii written directly in
-   JSX. More thorough, but it runs on every element creation, so it's opt-in.
+3. **Element props** — patches the JSX runtime (`jsx`/`jsxs`) and `React.createElement`, stripping
+   radii from every element's `style` prop as it renders. This is the catch-all: however a radius was
+   authored, it arrives here. **Option groups, cards and buttons need this one** — their styles are
+   closure-held, so layers 1 and 2 never see them. Results are memoized in a `WeakMap` keyed on the
+   style object, so a repeat render is one lookup and the style keeps a stable identity (React's
+   memoization is unaffected).
+4. **Masks** — **avatars and server icons aren't rounded by `borderRadius` at all**, they're masked,
+   so no amount of style stripping touches them. This drops `mask`/`clipPath` props, zeroes SVG
+   `rx`/`ry`, and swaps MaskedView for a plain View that renders its children unmasked.
 
-Everything layer 1 touches is recorded, so disabling the plugin restores the original radii.
+Layers 1–2 record every mutation, so disabling the plugin restores the original radii; layers 3–4 are
+pure patches and just stop applying.
 
-Two settings, in the plugin's sheet:
+Settings:
 
-- **Keep circles and pills round** — leaves radii ≥ 100 alone so avatars and pill buttons survive.
-  Off by default, because system24 squares those too (upstream zeroes `--radius-round` as well).
-- **Also strip inline styles** — enables layer 3.
+- **Square masked shapes** (on) — layer 4. Turn it off if a gradient or overlay looks wrong; mask
+  dropping is deliberately broad.
+- **Square design system components** (on) — layer 3.
+- **Keep circles and pills round** (off) — leaves radii ≥ 100 alone *and* keeps masks intact, so
+  avatars stay round. Off by default because system24 squares those too (upstream zeroes
+  `--radius-round` as well).
+- **Re-run now** / **Show what it hooked** — the latter reports which mechanisms were actually found
+  (`jsx`, `createElement`, whether MaskedView resolved) plus counts. That's the thing to read first
+  if something is still round.
 
-Limits worth knowing: radii that Discord draws with SVG masks (guild icons, some avatars) aren't
-style props and won't square off, and genuinely native Android views are out of reach entirely.
+The one case nothing here can reach: if a shape is drawn by a **native** Android drawable rather than
+by React Native, it isn't reachable from JS at all.
 
 ## Files
 
