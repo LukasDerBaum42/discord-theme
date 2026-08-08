@@ -32,12 +32,13 @@ system24's `--active`, which is as far as a color-only theme goes.
 Revenge fetches themes over HTTP — there's no local-file import — so the JSON has to be reachable
 from the phone.
 
-**From a hosted URL** (push this repo somewhere and use the raw URL):
-
 1. Discord → **Settings → Revenge → Themes → `+`**
-2. Paste the URL, e.g.
-   `https://raw.githubusercontent.com/<you>/<repo>/main/themes/system24.json`
+2. Paste:
+   `https://raw.githubusercontent.com/LukasDerBaum42/discord-theme/main/themes/system24.json`
 3. Select the theme, then **reload Discord** (Settings → Revenge → Reload).
+
+Swap the filename for any other theme, e.g.
+`.../main/themes/flavors/system24-nord.json`.
 
 **From this machine, for testing:**
 
@@ -53,8 +54,9 @@ re-add the theme.
 The monospace font is the single biggest part of the system24 look, and it's a separate Revenge
 feature from themes:
 
-- **Settings → Revenge → Fonts → `+`** → paste `fonts/dm-mono.json` (system24's default, DM Mono)
-  or `fonts/jetbrains-mono.json`, then select it and reload.
+- **Settings → Revenge → Fonts → `+`** → paste
+  `https://raw.githubusercontent.com/LukasDerBaum42/discord-theme/main/fonts/dm-mono.json`
+  (system24's default) or `.../fonts/jetbrains-mono.json`, then select it and reload.
 - Or, with a system24 theme already selected, the Fonts page offers **"extract fonts from theme"** —
   the theme manifests embed the DM Mono map for exactly this.
 
@@ -63,7 +65,8 @@ feature from themes:
 `--unrounding` needs code, not colors, so it ships as a plugin. Install the
 **directory** URL (trailing slash matters — the loader resolves `manifest.json` against it):
 
-**Settings → Revenge → Plugins → `+`** → `https://.../plugins/unrounding/`
+**Settings → Revenge → Plugins → `+`** →
+`https://raw.githubusercontent.com/LukasDerBaum42/discord-theme/main/plugins/unrounding/`
 
 Then reload Discord. Screens already rendered keep their old corners until they re-render, which is
 why a reload is the reliable way to see it.
