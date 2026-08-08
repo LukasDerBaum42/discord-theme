@@ -1,0 +1,13 @@
+{
+    "name": "system24-revenge",
+    "version": "1.0.0",
+    "description": "system24 ported to Revenge (Discord mobile)",
+    "type": "module",
+    "private": true,
+    "scripts": {
+        "build": "node scripts/build.mjs",
+        "verify": "node scripts/verify.mjs",
+        "test": "node scripts/test-plugin.mjs",
+        "serve": "node scripts/serve.mjs"
+    }
+}

@@ -1,0 +1,11 @@
+{
+    "name": "system24 unrounding",
+    "description": "Squares off Discord's rounded corners, the mobile counterpart to system24's --unrounding option.",
+    "authors": [
+        {
+            "name": "LukasDerBaum42"
+        }
+    ],
+    "main": "index.js",
+    "hash": "e4a327677438a0cd"
+}
