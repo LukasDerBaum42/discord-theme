@@ -31,10 +31,12 @@ function createMockApi({
 } = {}) {
     const log = [];
     const clipboardContents = [];
+    const patchCalls = [];
     const jsxRuntimes = jsxRuntime ? [jsxRuntime, ...extraJsxRuntimes] : extraJsxRuntimes;
 
     const patcher = {
         after(prop, object, callback) {
+            patchCalls.push({ prop, object, kind: 'after' });
             const original = object[prop];
             object[prop] = function (...args) {
                 const result = original.apply(this, args);
@@ -46,6 +48,7 @@ function createMockApi({
             };
         },
         instead(prop, object, callback) {
+            patchCalls.push({ prop, object, kind: 'instead' });
             const original = object[prop];
             object[prop] = function (...args) {
                 return callback(args, original.bind(this));
@@ -104,6 +107,7 @@ function createMockApi({
         React,
         log,
         clipboardContents,
+        patchCalls,
     };
 }
 
@@ -342,7 +346,100 @@ test('zeroes radius props passed outside of style', () => {
     assert.equal(calls[2].props.radius, 12, 'ambiguous prop untouched');
 });
 
+/* ── shape flags and components found via the diagnostics recorder ───── */
+test('flips the boolean shape flags Discord actually uses', () => {
+    const { runtime, calls } = createJsxRuntime();
+    const { api } = createMockApi({ jsxRuntime: runtime });
+    load(api).onLoad();
+
+    /* the guild bar item wrapper, i.e. the server icons */
+    runtime.jsx('GuildsBarAnimatedItemWrapper', { circle: true, preventClipping: true });
+    assert.equal(calls[0].props.circle, false);
+    assert.equal(calls[0].props.preventClipping, true, 'unrelated prop untouched');
+
+    runtime.jsx('TextInput', { isRound: true, value: 'hi' });
+    assert.equal(calls[1].props.isRound, false);
+    assert.equal(calls[1].props.value, 'hi');
+
+    /* only flipped when strictly true, so other uses of the name are safe */
+    runtime.jsx('Chart', { circle: { r: 4 } });
+    assert.deepEqual(calls[2].props.circle, { r: 4 });
+});
+
+test('zeroes sheetCornerRadius and strips maskStyle radii', () => {
+    const { runtime, calls } = createJsxRuntime();
+    const { api } = createMockApi({ jsxRuntime: runtime });
+    load(api).onLoad();
+
+    runtime.jsx('ReanimatedNativeStackScreen', { sheetCornerRadius: 16 });
+    assert.equal(calls[0].props.sheetCornerRadius, 0);
+
+    runtime.jsx('MaskedBadge', { maskStyle: { borderRadius: 12, width: 20 } });
+    assert.equal(calls[1].props.maskStyle.borderRadius, 0);
+    assert.equal(calls[1].props.maskStyle.width, 20);
+});
+
+test('matches MaskedView by name, not just identity', () => {
+    /* the component a finder returns is not necessarily the one rendered — this
+       is why the MaskedView counter sat at zero while MaskedView elements were
+       being recorded */
+    const foundByFinder = function MaskedView() {};
+    const actuallyRendered = function MaskedView() {};
+    const { runtime, calls } = createJsxRuntime();
+    const { api } = createMockApi({ jsxRuntime: runtime, maskedView: foundByFinder });
+
+    load(api).onLoad();
+
+    runtime.jsx(actuallyRendered, { maskElement: { type: 'Circle' }, children: 'pfp' });
+    assert.notEqual(calls[0].type, actuallyRendered, 'swapped despite a different identity');
+    assert.equal(calls[0].type(calls[0].props).children[0], 'pfp');
+});
+
+test('patches each jsx factory once even when finders return duplicates', () => {
+    const { runtime } = createJsxRuntime();
+    /* the real finders returned the same module for jsx and jsxs, so it got
+       wrapped four times over and every element was processed four times */
+    const { api, patchCalls } = createMockApi({
+        jsxRuntime: runtime,
+        extraJsxRuntimes: [runtime, runtime],
+    });
+
+    load(api).onLoad();
+
+    const jsxPatches = patchCalls.filter((c) => c.prop === 'jsx' && c.object === runtime);
+    assert.equal(jsxPatches.length, 1, 'wrapped exactly once');
+});
+
 /* ── diagnostics ─────────────────────────────────────────────────────── */
+test('records real shape props and ignores lookalikes', () => {
+    const { runtime } = createJsxRuntime();
+    const { api, clipboardContents } = createMockApi({ jsxRuntime: runtime });
+
+    const plugin = load(api);
+    plugin.onLoad();
+    plugin
+        .settings()
+        .children.find((c) => c.type === 'FormSwitchRow' && c.props.label.includes('Record'))
+        .props.onValueChange(true);
+
+    function Noisy() {}
+    runtime.jsx(Noisy, {
+        backgroundColor: '#000',
+        ios_backgroundColor: '#000',
+        removeClippedSubviews: true,
+        ellipsizeMode: 'tail',
+        onTapSoundmoji: () => {},
+        preventClipping: true,
+    });
+    function Real() {}
+    runtime.jsx(Real, { isRound: true, sheetCornerRadius: 8, maskElement: null, circle: true });
+
+    plugin.settings().children.filter((c) => c.type === 'FormRow')[1].props.onPress();
+    const report = clipboardContents[0];
+
+    assert.doesNotMatch(report, /Noisy/, 'lookalike prop names no longer bury the findings');
+    assert.match(report, /Real: isRound, sheetCornerRadius, maskElement, circle/);
+});
 test('records shape props only when recording is enabled', () => {
     const { runtime } = createJsxRuntime();
     const { api, clipboardContents } = createMockApi({

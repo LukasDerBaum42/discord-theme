@@ -14,17 +14,25 @@
      *      exports, which is most of Discord's design system.
      *   2. StyleSheet.create — catches stylesheets built after startup (Discord
      *      builds most screens' styles lazily, on first navigation).
-     *   3. ELEMENT PROPS — patch the JSX runtime and `React.createElement` and
-     *      strip radii from the `style` prop of every element. This is the
-     *      catch-all: however a radius was authored, it arrives here. Design
-     *      system components (option groups, cards, buttons) need this one.
-     *   4. MASKS — avatars and server icons aren't rounded by `borderRadius` at
-     *      all; they're masked, so no amount of style stripping touches them.
-     *      This drops `mask`/`clipPath` props, zeroes SVG `rx`/`ry`, and swaps
-     *      MaskedView for a plain View that renders its children unmasked.
+     *   3. ELEMENT PROPS — patch every JSX runtime and `React.createElement` and
+     *      strip radii from the style-bearing props of each element.
+     *   4. NATIVE PROPS — patch ReactNativeAttributePayload's create/diff. This
+     *      is the layer that works regardless of how the bundle was compiled:
+     *      patching a module export only affects callers that look the property
+     *      up at call time, and whatever captured the reference at require time
+     *      can never be reached.
+     *   5. SHAPES — avatars, server icons and inputs aren't rounded by
+     *      `borderRadius` at all, so none of the above touches them. Masks are
+     *      dropped, MaskedView renders its children unmasked, and the boolean
+     *      shape flags Discord actually uses are flipped off.
      *
-     * Everything layers 1 and 2 touch is recorded, so `onUnload` puts it back.
-     * Layers 3 and 4 are pure patches and simply stop applying.
+     * Layers 1 and 2 record what they change so `onUnload` puts it back; the
+     * rest are pure patches and simply stop applying.
+     *
+     * The prop names in layer 5 are not guesses. Every one came out of the
+     * diagnostics recorder below, which reports the shape-related props of the
+     * elements Discord actually renders — `circle` on the guild bar items,
+     * `isRound` on inputs, `sheetCornerRadius` on sheets.
      *
      * NOTE: the loader evals this file as `vendetta=>{return <file>}`, so the
      * file must *start* with the expression — a leading comment would put a line
@@ -68,7 +76,30 @@
     ]);
 
     /* Props that mask an element into a shape instead of rounding it */
-    const MASK_PROPS = ['mask', 'clipPath'];
+    const MASK_PROPS = ['mask', 'clipPath', 'maskElement'];
+
+    /* Props holding a style object rather than being one */
+    const STYLE_PROPS = [
+        'style',
+        'maskStyle',
+        'containerStyle',
+        'contentContainerStyle',
+        'imageStyle',
+        'wrapperStyle',
+    ];
+
+    /**
+     * Boolean props that make a component round, found by the diagnostics
+     * recorder rather than guessed:
+     *   circle          GuildsBarAnimatedItemWrapper — the server icons
+     *   isRound         TextInput, InputFieldContainer and friends
+     *   roundAsCircle   Fresco's native bitmap crop
+     */
+    const ROUND_FLAG_PROPS = ['roundAsCircle', 'isRound', 'circle', 'isCircular', 'circular', 'rounded'];
+
+    /* Component names to render unmasked. Matched by name, not identity: the
+       module a finder returns is not necessarily the one being rendered. */
+    const MASKED_VIEW_NAMES = new Set(['MaskedView', 'MaskedViewIOS', 'RNCMaskedView']);
 
     /**
      * Radius props passed directly rather than inside `style`.
@@ -77,13 +108,24 @@
      * shadow radius) and zeroing it would break unrelated things, so ambiguous
      * names are only *recorded* by the diagnostics below, never changed.
      */
-    const DIRECT_RADIUS_PROPS = ['borderRadius', 'cornerRadius', 'borderRadii'];
+    const DIRECT_RADIUS_PROPS = ['borderRadius', 'cornerRadius', 'borderRadii', 'sheetCornerRadius'];
 
-    /* Fresco's native circle crop on Android, which no style stripping reaches */
-    const ROUND_FLAG_PROPS = ['roundAsCircle'];
+    /**
+     * Substrings that make a prop name worth reporting when diagnosing.
+     *
+     * Case-sensitive and deliberately awkward: a plain 'ound' or 'lip' also
+     * matches backgroundColor, onTapSoundmoji, ellipsizeMode and
+     * removeClippedSubviews, which buried the real findings in noise.
+     */
+    const OBSERVE_HINTS = ['adius', 'ask', 'lipPath', 'Round', 'ircl', 'ircul', 'hape'];
 
-    /* Substrings that make a prop name worth reporting when diagnosing */
-    const OBSERVE_HINTS = ['adius', 'ask', 'lip', 'ound', 'ircl', 'hape', 'quircle'];
+    function looksShapeRelated(key) {
+        if (key.startsWith('round') || key.startsWith('circle')) return true;
+        for (const hint of OBSERVE_HINTS) {
+            if (key.indexOf(hint) !== -1) return true;
+        }
+        return false;
+    }
 
     /* A radius this large is a pill or a circle, not a panel corner */
     const CIRCLE_THRESHOLD = 100;
@@ -129,6 +171,7 @@
         styleProps: 0,
         directProps: 0,
         masksDropped: 0,
+        roundFlags: 0,
         maskedViews: 0,
         jsxModules: 0,
         payloadModules: 0,
@@ -329,13 +372,9 @@
     function observe(type, props) {
         let hits = null;
         for (const key of Object.keys(props)) {
-            for (const hint of OBSERVE_HINTS) {
-                if (key.indexOf(hint) !== -1) {
-                    if (!hits) hits = [];
-                    hits.push(key);
-                    break;
-                }
-            }
+            if (!looksShapeRelated(key)) continue;
+            if (!hits) hits = [];
+            hits.push(key);
         }
         if (!hits) return;
 
@@ -366,10 +405,12 @@
         };
 
         if (store.stripElementStyles) {
-            if (props.style) {
-                const stripped = stripStyle(props.style);
-                if (stripped !== props.style) {
-                    edit().style = stripped;
+            for (const key of STYLE_PROPS) {
+                const value = props[key];
+                if (!value || typeof value !== 'object') continue;
+                const stripped = stripStyle(value);
+                if (stripped !== value) {
+                    edit()[key] = stripped;
                     stats.styleProps++;
                 }
             }
@@ -403,12 +444,12 @@
                 if (value === undefined || value === null || value === 0) continue;
                 edit()[key] = 0;
             }
-            /* Fresco crops the bitmap itself for this one, so it survives
-               everything else — chat avatars are a likely user */
+            /* Boolean shape flags. Only flipped when strictly true, so a
+               component using one of these names for something else is safe. */
             for (const key of ROUND_FLAG_PROPS) {
                 if (props[key] !== true) continue;
                 edit()[key] = false;
-                stats.masksDropped++;
+                stats.roundFlags++;
             }
         }
 
@@ -454,10 +495,20 @@
             /* kept for diagnostics, so a swapped MaskedView is still reported
                under its real name rather than as UnmaskedView */
             const type = args[0];
-            if (maskedView && type === maskedView) {
-                args[0] = UnmaskedView;
-                stats.maskedViews++;
+
+            /*
+             * Identity is not enough. The diagnostics showed MaskedView elements
+             * rendering while this counter stayed at zero: the component the
+             * finder returns and the one actually rendered are different objects
+             * (separate module instances, or a wrapper). Match on name too.
+             */
+            if (store.squareMasks && !store.keepCircles && typeof type !== 'string') {
+                if (type === maskedView || MASKED_VIEW_NAMES.has(typeName(type))) {
+                    args[0] = UnmaskedView;
+                    stats.maskedViews++;
+                }
             }
+
             const props = transformProps(type, args[1]);
             if (props !== args[1]) args[1] = props;
             return args;
@@ -473,6 +524,15 @@
          * working, right up until the counters all read zero.
          */
         const runtimes = new Set();
+        /*
+         * The finders return duplicates, and wrapping one module four times ran
+         * every element through this four times over.
+         *
+         * Keyed on module + prop name rather than on the function, because the
+         * first patch replaces the function — so a function-identity check would
+         * never recognise the module it had just patched.
+         */
+        const patchedNames = new Map();
         for (const name of ['jsx', 'jsxs', 'jsxDEV']) {
             let found;
             try {
@@ -482,6 +542,15 @@
             }
             for (const module of found) {
                 if (!module || typeof module[name] !== 'function') continue;
+
+                let names = patchedNames.get(module);
+                if (!names) {
+                    names = new Set();
+                    patchedNames.set(module, names);
+                }
+                if (names.has(name)) continue;
+                names.add(name);
+
                 unpatches.push(
                     patcher.instead(name, module, (args, original) => original(...rewrite(args)))
                 );
@@ -523,7 +592,11 @@
             return;
         }
 
+        const seen = new Set();
         for (const module of candidates) {
+            if (seen.has(module)) continue;
+            seen.add(module);
+
             if (
                 !module ||
                 typeof module.create !== 'function' ||
@@ -674,7 +747,7 @@
             `jsx modules patched: ${stats.jsxModules}, native payload modules: ${stats.payloadModules}`,
             /* the first number to read: if interception works at all */
             `elements seen: ${stats.elementsSeen}`,
-            `counts: ${stats.sweptValues} swept / ${stats.styleProps} style props / ${stats.directProps} direct props / ${stats.masksDropped} masks / ${stats.maskedViews} MaskedViews`,
+            `counts: ${stats.sweptValues} swept / ${stats.styleProps} style props / ${stats.directProps} direct props / ${stats.masksDropped} masks / ${stats.roundFlags} round flags / ${stats.maskedViews} MaskedViews`,
             `modules swept: ${stats.modules}`,
             `tokens: ${probeTokens()}`,
         ];

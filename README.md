@@ -90,9 +90,26 @@ are four layers:
    property up at call time, and anything that captured the reference when it first required the
    module keeps calling the original forever. Both sides of `diff` are sanitized identically, or the
    diff would report a change straight back to the rounded value.
-4. **Masks** — **avatars and server icons aren't rounded by `borderRadius` at all**, they're masked,
-   so no amount of style stripping touches them. This drops `mask`/`clipPath` props, zeroes SVG
-   `rx`/`ry`, and swaps MaskedView for a plain View that renders its children unmasked.
+4. **Shapes** — **avatars, server icons and inputs aren't rounded by `borderRadius` at all**, so none
+   of the above touches them. Masks (`mask`, `clipPath`, `maskElement`) are dropped, SVG `rx`/`ry` are
+   zeroed, MaskedView is swapped for a plain View that renders its children unmasked, and the boolean
+   shape flags Discord uses are flipped off.
+
+   These prop names are **not guesses** — each came out of the diagnostics recorder, reading the props
+   Discord actually puts on its elements:
+
+   | prop | seen on | what it is |
+   | --- | --- | --- |
+   | `circle` | `GuildsBarAnimatedItemWrapper` | the server icons |
+   | `isRound` | `TextInput`, `InputFieldContainer` | inputs and fields |
+   | `sheetCornerRadius` | `ReanimatedNativeStackScreen` | bottom sheets |
+   | `maskStyle` | `MaskedBadge` | badge cutouts |
+   | `maskElement` | `MaskedView` | avatar status notch |
+   | `roundAsCircle` | native images | Fresco's bitmap crop |
+
+   MaskedView is matched **by name, not identity**: the component a Metro finder returns is not
+   necessarily the one being rendered, which is why an identity check reported zero hits while
+   MaskedView elements were demonstrably rendering.
 
 Layers 1–2 record every mutation, so disabling the plugin restores the original radii; layers 3–4 are
 pure patches and just stop applying.
@@ -133,9 +150,9 @@ Deliberate non-fixes, both visible in that report:
 - **Ambiguous props are recorded, never changed.** A bare `radius` prop could be a blur or shadow
   radius, so zeroing it on sight would break unrelated things. Only `borderRadius`, `cornerRadius`,
   `borderRadii` and Fresco's `roundAsCircle` are changed outright.
-- **Native drawables are unreachable.** If a shape is drawn by Android rather than by React Native —
-  a real possibility for parts of the chat list — no JS plugin can touch it, and the report will show
-  no round-ish props on the element at all.
+- **Native views are unreachable.** The chat is a native Discord component (`DCDChat` shows up in the
+  recorder with no shape props on it at all), so avatars drawn inside the native message list are not
+  React Native views and no JS plugin can reach them. Everything drawn by RN is fair game; that isn't.
 
 ## Files
 
