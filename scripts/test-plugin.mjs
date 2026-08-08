@@ -24,11 +24,14 @@ function createMockApi({
     modules = {},
     storage = {},
     jsxRuntime = null,
+    extraJsxRuntimes = [],
+    nativePayloads = [],
     maskedView = null,
     tokens = null,
 } = {}) {
     const log = [];
     const clipboardContents = [];
+    const jsxRuntimes = jsxRuntime ? [jsxRuntime, ...extraJsxRuntimes] : extraJsxRuntimes;
 
     const patcher = {
         after(prop, object, callback) {
@@ -64,6 +67,12 @@ function createMockApi({
                 findByProps: (...props) => {
                     if (props.includes('unsafe_rawColors')) return tokens;
                     return jsxRuntime && props.every((p) => p in jsxRuntime) ? jsxRuntime : null;
+                },
+                findByPropsAll: (...props) => {
+                    if (props.includes('create') && props.includes('diff')) {
+                        return nativePayloads;
+                    }
+                    return jsxRuntimes.filter((m) => props.every((p) => p in m));
                 },
                 findByName: (name) => (name === 'MaskedView' ? maskedView : null),
                 findByDisplayName: () => null,
@@ -397,6 +406,105 @@ test('report survives a missing clipboard', () => {
     plugin.settings().children.filter((c) => c.type === 'FormRow')[1].props.onPress();
 
     assert.ok(log.some((line) => line.includes('clipboard unavailable')));
+});
+
+/* ── the stale-reference problem ─────────────────────────────────────── */
+test('patches every jsx module, not just the first match', () => {
+    /* a bundle has several: react/jsx-runtime, jsx-dev-runtime, re-export shims.
+       Patching only the first installs a hook nothing calls. */
+    const first = createJsxRuntime();
+    const second = createJsxRuntime();
+    const { api } = createMockApi({
+        jsxRuntime: first.runtime,
+        extraJsxRuntimes: [second.runtime],
+    });
+
+    load(api).onLoad();
+
+    second.runtime.jsx('View', { style: { borderRadius: 9 } });
+    assert.equal(second.calls[0].props.style.borderRadius, 0, 'second runtime also patched');
+});
+
+test('sanitizes native view props, surviving captured jsx references', () => {
+    /* mirrors ReactNativeAttributePayload: create(props, validAttributes) and
+       diff(prev, next, validAttributes) */
+    const payload = {
+        create: (props, _validAttributes) => props,
+        diff: (prev, next, _validAttributes) => [prev, next],
+    };
+    /* a decoy with the right names but the wrong shape must be left alone */
+    const decoy = { create: (a) => a, diff: (a) => a };
+    const { api } = createMockApi({ nativePayloads: [decoy, payload] });
+    const originalDecoy = decoy.create;
+
+    load(api).onLoad();
+    assert.equal(decoy.create, originalDecoy, 'decoy module not patched');
+
+    const mounted = payload.create({ style: { borderRadius: 14 } }, {});
+    assert.equal(mounted.style.borderRadius, 0, 'mount path sanitized');
+
+    const [prev, next] = payload.diff(
+        { style: { borderRadius: 14 } },
+        { style: { borderRadius: 14 } },
+        {}
+    );
+    assert.equal(prev.style.borderRadius, 0, 'both sides of the diff sanitized');
+    assert.equal(next.style.borderRadius, 0);
+
+    /* SVG masks reach native through the same funnel */
+    const masked = payload.create({ mask: 'url(#avatar)' }, {});
+    assert.equal('mask' in masked, false);
+});
+
+test('report exposes whether interception happens at all', () => {
+    const { runtime } = createJsxRuntime();
+    const payload = { create: (p, _v) => p, diff: (a, b, _v) => [a, b] };
+    const { api, clipboardContents } = createMockApi({
+        jsxRuntime: runtime,
+        nativePayloads: [payload],
+    });
+
+    const plugin = load(api);
+    plugin.onLoad();
+
+    const copy = () =>
+        plugin.settings().children.filter((c) => c.type === 'FormRow')[1].props.onPress();
+
+    copy();
+    assert.match(clipboardContents[0], /jsx modules patched: 1, native payload modules: 1/);
+
+    const seen = (report) => Number(/elements seen: (\d+)/.exec(report)[1]);
+    const before = seen(clipboardContents[0]);
+
+    runtime.jsx('View', { style: { borderRadius: 4 } });
+    copy();
+    assert.ok(seen(clipboardContents[1]) > before, 'counter tracks intercepted elements');
+});
+
+test('toggling recording keeps the evidence already gathered', () => {
+    const { runtime } = createJsxRuntime();
+    const { api, clipboardContents } = createMockApi({ jsxRuntime: runtime });
+
+    const plugin = load(api);
+    plugin.onLoad();
+
+    function GuildIcon() {}
+    const recordSwitch = plugin
+        .settings()
+        .children.find((c) => c.type === 'FormSwitchRow' && c.props.label.includes('Record'));
+    recordSwitch.props.onValueChange(true);
+
+    runtime.jsx(GuildIcon, { borderRadius: 16 });
+
+    /* flipping another setting re-applies the patches; that must not erase what
+       has been observed, which is what made the first real report unreadable */
+    const masksSwitch = plugin
+        .settings()
+        .children.find((c) => c.type === 'FormSwitchRow' && c.props.label.includes('masked'));
+    masksSwitch.props.onValueChange(false);
+
+    plugin.settings().children.filter((c) => c.type === 'FormRow')[1].props.onPress();
+    assert.match(clipboardContents[0], /GuildIcon: borderRadius/, 'observation survived re-apply');
 });
 
 /* ── settings migration ──────────────────────────────────────────────── */

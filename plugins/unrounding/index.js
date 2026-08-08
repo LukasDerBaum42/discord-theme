@@ -114,21 +114,28 @@
 
     const MAX_OBSERVED = 150;
 
-    let stats = {};
-    const resetStats = () => {
-        stats = {
-            modules: 0,
-            sweptValues: 0,
-            styleProps: 0,
-            directProps: 0,
-            masksDropped: 0,
-            maskedViews: 0,
-            hooks: [],
-            /* component name -> set of round-ish prop names seen on it */
-            observed: new Map(),
-        };
+    /**
+     * Counters live for the whole session, not per apply().
+     *
+     * An earlier version rebuilt these on every re-apply, which meant flipping a
+     * setting silently threw away the evidence gathered so far — the one thing
+     * the report exists to show.
+     */
+    const stats = {
+        modules: 0,
+        sweptValues: 0,
+        /* elements the hooks actually saw; 0 means interception is not working */
+        elementsSeen: 0,
+        styleProps: 0,
+        directProps: 0,
+        masksDropped: 0,
+        maskedViews: 0,
+        jsxModules: 0,
+        payloadModules: 0,
+        hooks: [],
+        /* component name -> set of round-ish prop names seen on it */
+        observed: new Map(),
     };
-    resetStats();
 
     /* ── zeroing ──────────────────────────────────────────────────────── */
 
@@ -349,6 +356,7 @@
     function transformProps(type, props) {
         if (!props || typeof props !== 'object') return props;
 
+        stats.elementsSeen++;
         if (store.recordElements) observe(type, props);
 
         let next = props;
@@ -455,19 +463,34 @@
             return args;
         };
 
-        /* the automatic JSX runtime, which is what Discord's bundle compiles to */
-        const runtime = metro.findByProps('jsx', 'jsxs');
-        if (runtime) {
-            for (const name of ['jsx', 'jsxs']) {
-                if (typeof runtime[name] !== 'function') continue;
+        /*
+         * The automatic JSX runtime, which is what Discord's bundle compiles to.
+         *
+         * Patch *every* module that exports a jsx factory, not just the first
+         * match: a bundle contains several (`react/jsx-runtime`,
+         * `jsx-dev-runtime`, re-exporting shims), and patching the wrong one
+         * installs a hook that nothing ever calls — which looks identical to
+         * working, right up until the counters all read zero.
+         */
+        const runtimes = new Set();
+        for (const name of ['jsx', 'jsxs', 'jsxDEV']) {
+            let found;
+            try {
+                found = metro.findByPropsAll(name) || [];
+            } catch {
+                found = [];
+            }
+            for (const module of found) {
+                if (!module || typeof module[name] !== 'function') continue;
                 unpatches.push(
-                    patcher.instead(name, runtime, (args, original) => original(...rewrite(args)))
+                    patcher.instead(name, module, (args, original) => original(...rewrite(args)))
                 );
+                runtimes.add(module);
                 stats.hooks.push(name);
             }
-        } else {
-            logger.warn('JSX runtime not found');
         }
+        stats.jsxModules = runtimes.size;
+        if (runtimes.size === 0) logger.warn('no JSX runtime found');
 
         /* the classic runtime, still used by plugins and older screens */
         if (React && typeof React.createElement === 'function') {
@@ -478,11 +501,77 @@
         }
     }
 
+    /**
+     * Sanitize props on their way to the native view.
+     *
+     * This is the hook that does not care how the bundle was compiled. Patching
+     * a module's exported function only affects callers that look the property
+     * up at call time; anything that captured the reference when it was first
+     * required keeps calling the original, and there is no way to reach those
+     * after the fact. Every native view's props, however, funnel through
+     * ReactNativeAttributePayload on mount (`create`) and update (`diff`) — the
+     * exact place style and SVG props are handed to the platform.
+     *
+     * Identified strictly by shape and arity, since `create`/`diff` are generic
+     * names: create(props, validAttributes), diff(prev, next, validAttributes).
+     */
+    function patchNativePayload() {
+        let candidates;
+        try {
+            candidates = metro.findByPropsAll('create', 'diff') || [];
+        } catch {
+            return;
+        }
+
+        for (const module of candidates) {
+            if (
+                !module ||
+                typeof module.create !== 'function' ||
+                typeof module.diff !== 'function' ||
+                module.create.length !== 2 ||
+                module.diff.length !== 3
+            ) {
+                continue;
+            }
+
+            const sanitize = (props) => {
+                if (!props || typeof props !== 'object') return props;
+                try {
+                    return transformProps('nativeProps', props);
+                } catch {
+                    return props;
+                }
+            };
+
+            unpatches.push(
+                patcher.instead('create', module, (args, original) => {
+                    args[0] = sanitize(args[0]);
+                    return original(...args);
+                })
+            );
+            unpatches.push(
+                patcher.instead('diff', module, (args, original) => {
+                    /* both sides must be sanitized the same way, or the diff
+                       reports a change back to the rounded value */
+                    args[0] = sanitize(args[0]);
+                    args[1] = sanitize(args[1]);
+                    return original(...args);
+                })
+            );
+
+            stats.payloadModules++;
+            stats.hooks.push('nativeProps');
+        }
+    }
+
     /* ── lifecycle ────────────────────────────────────────────────────── */
 
     function apply() {
-        resetStats();
         styleCache = new WeakMap();
+        stats.hooks = [];
+        stats.modules = 0;
+        stats.jsxModules = 0;
+        stats.payloadModules = 0;
 
         sweepRegistry();
         zeroTokenModule();
@@ -501,7 +590,10 @@
             })
         );
 
-        if (store.stripElementStyles || store.squareMasks) patchElementCreation();
+        if (store.stripElementStyles || store.squareMasks) {
+            patchElementCreation();
+            patchNativePayload();
+        }
 
         logger.log(
             `swept ${stats.sweptValues} radii across ${stats.modules} modules; hooks: ${
@@ -579,6 +671,9 @@
             'system24 unrounding diagnostics',
             `config: squareMasks=${store.squareMasks} stripElementStyles=${store.stripElementStyles} keepCircles=${store.keepCircles}`,
             `hooks: ${stats.hooks.join(', ') || 'none'}`,
+            `jsx modules patched: ${stats.jsxModules}, native payload modules: ${stats.payloadModules}`,
+            /* the first number to read: if interception works at all */
+            `elements seen: ${stats.elementsSeen}`,
             `counts: ${stats.sweptValues} swept / ${stats.styleProps} style props / ${stats.directProps} direct props / ${stats.masksDropped} masks / ${stats.maskedViews} MaskedViews`,
             `modules swept: ${stats.modules}`,
             `tokens: ${probeTokens()}`,
@@ -609,6 +704,13 @@
         const toggle = (key, label) => (value) => {
             store[key] = value;
             reapply();
+            showToast(label);
+        };
+
+        /* recording changes nothing about the patches, so it must not re-apply
+           them — doing so used to discard everything recorded so far */
+        const setFlag = (key, label) => (value) => {
+            store[key] = value;
             showToast(label);
         };
 
@@ -644,7 +746,7 @@
                 subLabel:
                     'Notes the shape-related props of every element rendered, handled or not. Turn on, open the screen that is still round, then copy the report.',
                 value: store.recordElements,
-                onValueChange: toggle('recordElements', 'Recording updated'),
+                onValueChange: setFlag('recordElements', 'Recording updated'),
             }),
             React.createElement(FormDivider, null),
             React.createElement(FormRow, {

@@ -80,12 +80,16 @@ are four layers:
    styles live in a closure rather than on module exports — which is most of the design system.
 2. **`StyleSheet.create` patch** — Discord builds most screens' styles lazily on first navigation, so
    anything created after startup gets the same treatment.
-3. **Element props** — patches the JSX runtime (`jsx`/`jsxs`) and `React.createElement`, stripping
-   radii from every element's `style` prop as it renders. This is the catch-all: however a radius was
-   authored, it arrives here. **Option groups, cards and buttons need this one** — their styles are
-   closure-held, so layers 1 and 2 never see them. Results are memoized in a `WeakMap` keyed on the
-   style object, so a repeat render is one lookup and the style keeps a stable identity (React's
-   memoization is unaffected).
+3. **Element props** — patches every JSX runtime module (`jsx`/`jsxs`/`jsxDEV`) and
+   `React.createElement`, stripping radii from every element's `style` prop as it renders. Results are
+   memoized in a `WeakMap` keyed on the style object, so a repeat render is one lookup and the style
+   keeps a stable identity (React's memoization is unaffected).
+3b. **Native view props** — patches `ReactNativeAttributePayload`'s `create`/`diff`, the funnel every
+   native view's props pass through on mount and update. This is the layer that does not care how the
+   bundle was compiled: patching a module's exported function only affects callers that look the
+   property up at call time, and anything that captured the reference when it first required the
+   module keeps calling the original forever. Both sides of `diff` are sanitized identically, or the
+   diff would report a change straight back to the rounded value.
 4. **Masks** — **avatars and server icons aren't rounded by `borderRadius` at all**, they're masked,
    so no amount of style stripping touches them. This drops `mask`/`clipPath` props, zeroes SVG
    `rx`/`ry`, and swaps MaskedView for a plain View that renders its children unmasked.
@@ -115,10 +119,14 @@ so the plugin can tell you:
 2. Open the screen that's still round, and scroll it so the element renders.
 3. Come back and hit **Copy diagnostics**.
 
-The report lists which hooks were installed, whether MaskedView resolved, what the design system's
-radius tokens currently are, counts of everything changed, and — per component name — every prop
-whose name suggests a shape. That last section is the useful part: it names the component and the
-exact prop keeping it round.
+The report lists which hooks were installed, how many jsx and native-payload modules were patched,
+whether MaskedView resolved, the design system's live radius token values, counts of everything
+changed, and — per component name — every prop whose name suggests a shape.
+
+**Read `elements seen` first.** If it's 0, interception isn't working at all and nothing else in the
+report means anything; if it's large while `style props` is 0, the hooks fire but the radii are coming
+from somewhere else. Counters are cumulative for the session and survive a re-apply, so flipping a
+setting doesn't discard what you gathered.
 
 Deliberate non-fixes, both visible in that report:
 
