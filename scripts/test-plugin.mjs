@@ -20,8 +20,15 @@ const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const script = readFileSync(join(root, 'plugins/unrounding/index.js'), 'utf8');
 
 /** Minimal stand-in for the pieces of `vendetta` the plugin touches. */
-function createMockApi({ modules = {}, storage = {}, jsxRuntime = null, maskedView = null } = {}) {
+function createMockApi({
+    modules = {},
+    storage = {},
+    jsxRuntime = null,
+    maskedView = null,
+    tokens = null,
+} = {}) {
     const log = [];
+    const clipboardContents = [];
 
     const patcher = {
         after(prop, object, callback) {
@@ -54,13 +61,20 @@ function createMockApi({ modules = {}, storage = {}, jsxRuntime = null, maskedVi
             patcher,
             metro: {
                 modules,
-                findByProps: (...props) =>
-                    jsxRuntime && props.every((p) => p in jsxRuntime) ? jsxRuntime : null,
+                findByProps: (...props) => {
+                    if (props.includes('unsafe_rawColors')) return tokens;
+                    return jsxRuntime && props.every((p) => p in jsxRuntime) ? jsxRuntime : null;
+                },
                 findByName: (name) => (name === 'MaskedView' ? maskedView : null),
                 findByDisplayName: () => null,
                 common: {
                     React,
                     ReactNative: { StyleSheet, ScrollView: 'ScrollView', View: 'View' },
+                    clipboard: {
+                        setString: (text) => {
+                            clipboardContents.push(text);
+                        },
+                    },
                 },
             },
             storage: { useProxy: () => {} },
@@ -80,6 +94,7 @@ function createMockApi({ modules = {}, storage = {}, jsxRuntime = null, maskedVi
         StyleSheet,
         React,
         log,
+        clipboardContents,
     };
 }
 
@@ -286,23 +301,115 @@ test('does not hook element creation when both element layers are off', () => {
     const original = runtime.jsx;
     const { api } = createMockApi({
         jsxRuntime: runtime,
-        storage: { configVersion: 2, stripElementStyles: false, squareMasks: false, keepCircles: false },
+        storage: {
+            configVersion: 3,
+            stripElementStyles: false,
+            squareMasks: false,
+            keepCircles: false,
+            recordElements: false,
+        },
     });
 
     load(api).onLoad();
     assert.equal(runtime.jsx, original, 'jsx runtime untouched');
 });
 
+test('zeroes radius props passed outside of style', () => {
+    const { runtime, calls } = createJsxRuntime();
+    const { api } = createMockApi({ jsxRuntime: runtime });
+    load(api).onLoad();
+
+    runtime.jsx('Card', { borderRadius: 16, cornerRadius: 8 });
+    assert.equal(calls[0].props.borderRadius, 0);
+    assert.equal(calls[0].props.cornerRadius, 0);
+
+    /* Fresco's native circle crop, which nothing else can reach */
+    runtime.jsx('Image', { roundAsCircle: true, source: 'x' });
+    assert.equal(calls[1].props.roundAsCircle, false);
+    assert.equal(calls[1].props.source, 'x');
+
+    /* a bare `radius` is ambiguous (blur/shadow radius) and must be left alone */
+    runtime.jsx('BlurView', { radius: 12 });
+    assert.equal(calls[2].props.radius, 12, 'ambiguous prop untouched');
+});
+
+/* ── diagnostics ─────────────────────────────────────────────────────── */
+test('records shape props only when recording is enabled', () => {
+    const { runtime } = createJsxRuntime();
+    const { api, clipboardContents } = createMockApi({
+        jsxRuntime: runtime,
+        storage: { configVersion: 3, squareMasks: true, stripElementStyles: true, keepCircles: false, recordElements: false },
+    });
+
+    const plugin = load(api);
+    plugin.onLoad();
+
+    function ChatAvatar() {}
+    runtime.jsx(ChatAvatar, { roundAsCircle: true, someShape: 'circle' });
+
+    const rows = () => plugin.settings().children.filter((c) => c.type === 'FormRow');
+    rows()[1].props.onPress();
+    assert.match(clipboardContents[0], /observed: recording is off/);
+
+    /* turn recording on through the switch, then render again */
+    const recordSwitch = plugin
+        .settings()
+        .children.find((c) => c.type === 'FormSwitchRow' && c.props.label.includes('Record'));
+    recordSwitch.props.onValueChange(true);
+
+    runtime.jsx(ChatAvatar, { roundAsCircle: true, borderRadius: 4 });
+    rows()[1].props.onPress();
+    assert.match(clipboardContents[1], /ChatAvatar: roundAsCircle, borderRadius/);
+});
+
+test('report copies to the clipboard and includes the token probe', () => {
+    const { runtime } = createJsxRuntime();
+    const { api, clipboardContents, log } = createMockApi({
+        jsxRuntime: runtime,
+        tokens: { unsafe_rawColors: {}, colors: {}, radii: { sm: 4, lg: 16 } },
+    });
+
+    const plugin = load(api);
+    plugin.onLoad();
+
+    /* the tokens module is zeroed directly, not via the registry sweep */
+    const report = (() => {
+        plugin.settings().children.filter((c) => c.type === 'FormRow')[1].props.onPress();
+        return clipboardContents[0];
+    })();
+
+    assert.match(report, /system24 unrounding diagnostics/);
+    assert.match(report, /hooks: .*jsx, jsxs, createElement/);
+    assert.match(report, /radii=\{sm:0,lg:0\}/, 'token radii zeroed and reported');
+    assert.ok(log.some((line) => line.includes('system24 unrounding diagnostics')), 'also logged');
+});
+
+test('report survives a missing clipboard', () => {
+    const { api, log } = createMockApi();
+    api.metro.common.clipboard = {
+        setString() {
+            throw new Error('no clipboard module');
+        },
+    };
+
+    const plugin = load(api);
+    plugin.onLoad();
+    plugin.settings().children.filter((c) => c.type === 'FormRow')[1].props.onPress();
+
+    assert.ok(log.some((line) => line.includes('clipboard unavailable')));
+});
+
 /* ── settings migration ──────────────────────────────────────────────── */
-test('migrates a v1 install onto the new defaults', () => {
+test('migrates an older install onto the new defaults', () => {
     const storage = { keepCircles: false, patchInlineStyles: false };
     const { api } = createMockApi({ storage });
 
     load(api);
     assert.equal(storage.stripElementStyles, true, 'element stripping now on by default');
     assert.equal(storage.squareMasks, true, 'mask squaring now on by default');
+    assert.equal(storage.recordElements, false, 'recording stays opt-in');
     assert.equal('patchInlineStyles' in storage, false, 'old key removed');
-    assert.equal(storage.configVersion, 2);
+    assert.equal(storage.configVersion, 3);
 });
 
 test('migration preserves an explicit keepCircles choice', () => {
@@ -365,7 +472,7 @@ test('settings component renders and re-applies on toggle', () => {
     assert.equal(tree.type, 'ScrollView');
     const switches = tree.children.filter((c) => c.type === 'FormSwitchRow');
     const rows = tree.children.filter((c) => c.type === 'FormRow');
-    assert.equal(switches.length, 3);
+    assert.equal(switches.length, 4);
     assert.equal(rows.length, 2, 're-run and diagnostics rows');
 
     /* toggling must revert then re-apply, not zero an already-zeroed value */

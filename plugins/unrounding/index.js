@@ -33,7 +33,7 @@
      */
 
     const { patcher, metro, storage: storageApi, ui, logger } = vendetta;
-    const { React, ReactNative } = metro.common;
+    const { React, ReactNative, clipboard } = metro.common;
     const { StyleSheet, ScrollView, View } = ReactNative;
     const { showToast } = ui.toasts;
     const store = vendetta.plugin.storage;
@@ -57,10 +57,33 @@
     const RADIUS_KEY_SET = new Set(RADIUS_KEYS);
 
     /* Discord's design tokens keep their radii in objects under these keys */
-    const TOKEN_KEYS = new Set(['radii', 'radius', 'borderRadii']);
+    const TOKEN_KEYS = new Set([
+        'radii',
+        'radius',
+        'borderRadii',
+        'radiusTokens',
+        'RadiusTokens',
+        'cornerRadius',
+        'CornerRadius',
+    ]);
 
     /* Props that mask an element into a shape instead of rounding it */
     const MASK_PROPS = ['mask', 'clipPath'];
+
+    /**
+     * Radius props passed directly rather than inside `style`.
+     *
+     * Kept deliberately narrow: a bare `radius` prop is ambiguous (blur radius,
+     * shadow radius) and zeroing it would break unrelated things, so ambiguous
+     * names are only *recorded* by the diagnostics below, never changed.
+     */
+    const DIRECT_RADIUS_PROPS = ['borderRadius', 'cornerRadius', 'borderRadii'];
+
+    /* Fresco's native circle crop on Android, which no style stripping reaches */
+    const ROUND_FLAG_PROPS = ['roundAsCircle'];
+
+    /* Substrings that make a prop name worth reporting when diagnosing */
+    const OBSERVE_HINTS = ['adius', 'ask', 'lip', 'ound', 'ircl', 'hape', 'quircle'];
 
     /* A radius this large is a pill or a circle, not a panel corner */
     const CIRCLE_THRESHOLD = 100;
@@ -70,11 +93,12 @@
     const MAX_UNDO = 50000;
 
     /* Bumped when defaults change, so an existing install picks them up */
-    const CONFIG_VERSION = 2;
+    const CONFIG_VERSION = 3;
     if (store.configVersion !== CONFIG_VERSION) {
         store.keepCircles = store.keepCircles === true;
         store.stripElementStyles = true;
         store.squareMasks = true;
+        store.recordElements = store.recordElements === true;
         store.configVersion = CONFIG_VERSION;
         /* v1's name for what is now stripElementStyles, and it defaulted off */
         if ('patchInlineStyles' in store) delete store.patchInlineStyles;
@@ -88,15 +112,20 @@
     /** Memoized style stripping, so repeat renders don't re-clone. */
     let styleCache = new WeakMap();
 
+    const MAX_OBSERVED = 150;
+
     let stats = {};
     const resetStats = () => {
         stats = {
             modules: 0,
             sweptValues: 0,
             styleProps: 0,
+            directProps: 0,
             masksDropped: 0,
             maskedViews: 0,
             hooks: [],
+            /* component name -> set of round-ish prop names seen on it */
+            observed: new Map(),
         };
     };
     resetStats();
@@ -210,6 +239,33 @@
         stats.sweptValues = undoLog.length;
     }
 
+    /**
+     * Zero the design system's radius tokens directly.
+     *
+     * The registry sweep only reaches initialized modules, and the tokens module
+     * may not be one of them yet — but everything the design system builds later
+     * reads these values, so they are worth zeroing explicitly rather than
+     * hoping the sweep got there first.
+     */
+    function zeroTokenModule() {
+        let tokens;
+        try {
+            tokens = metro.findByProps('unsafe_rawColors', 'colors');
+        } catch {
+            return;
+        }
+        if (!tokens) return;
+
+        for (const key of Object.keys(tokens)) {
+            if (!TOKEN_KEYS.has(key)) continue;
+            try {
+                zeroTokenObject(tokens[key]);
+            } catch {
+                /* getter threw */
+            }
+        }
+    }
+
     /* ── layer 3/4: element props ─────────────────────────────────────── */
 
     /** Copy-on-write, memoized: only allocates when there is a radius to remove. */
@@ -246,12 +302,54 @@
         return result;
     }
 
+    /** A readable name for whatever was passed as an element type. */
+    function typeName(type) {
+        if (typeof type === 'string') return type;
+        if (typeof type === 'function') return type.displayName || type.name || 'anonymous';
+        if (type && typeof type === 'object') {
+            return type.displayName || (type.render && type.render.name) || 'component';
+        }
+        return String(type);
+    }
+
+    /**
+     * Record any prop whose name suggests a shape, handled or not.
+     *
+     * This is the whole point of the diagnostics: when something is still round,
+     * guessing at mechanisms is worthless next to knowing which props Discord
+     * actually put on the element.
+     */
+    function observe(type, props) {
+        let hits = null;
+        for (const key of Object.keys(props)) {
+            for (const hint of OBSERVE_HINTS) {
+                if (key.indexOf(hint) !== -1) {
+                    if (!hits) hits = [];
+                    hits.push(key);
+                    break;
+                }
+            }
+        }
+        if (!hits) return;
+
+        const name = typeName(type);
+        let seen = stats.observed.get(name);
+        if (!seen) {
+            if (stats.observed.size >= MAX_OBSERVED) return;
+            seen = new Set();
+            stats.observed.set(name, seen);
+        }
+        for (const hit of hits) seen.add(hit);
+    }
+
     /**
      * Rewrite an element's props. Returns the same object when there is nothing
      * to change, so React's identity checks are unaffected.
      */
-    function transformProps(props) {
+    function transformProps(type, props) {
         if (!props || typeof props !== 'object') return props;
+
+        if (store.recordElements) observe(type, props);
 
         let next = props;
         const edit = () => {
@@ -259,11 +357,28 @@
             return next;
         };
 
-        if (store.stripElementStyles && props.style) {
-            const stripped = stripStyle(props.style);
-            if (stripped !== props.style) {
-                edit().style = stripped;
-                stats.styleProps++;
+        if (store.stripElementStyles) {
+            if (props.style) {
+                const stripped = stripStyle(props.style);
+                if (stripped !== props.style) {
+                    edit().style = stripped;
+                    stats.styleProps++;
+                }
+            }
+            /* radii handed over as their own prop rather than inside style */
+            for (const key of DIRECT_RADIUS_PROPS) {
+                const value = props[key];
+                if (value === undefined || value === null) continue;
+                if (typeof value === 'object') {
+                    const stripped = stripStyle(value);
+                    if (stripped !== value) {
+                        edit()[key] = stripped;
+                        stats.directProps++;
+                    }
+                } else if (isZeroableRadius(value)) {
+                    edit()[key] = zeroFor(value);
+                    stats.directProps++;
+                }
             }
         }
 
@@ -279,6 +394,13 @@
                 const value = props[key];
                 if (value === undefined || value === null || value === 0) continue;
                 edit()[key] = 0;
+            }
+            /* Fresco crops the bitmap itself for this one, so it survives
+               everything else — chat avatars are a likely user */
+            for (const key of ROUND_FLAG_PROPS) {
+                if (props[key] !== true) continue;
+                edit()[key] = false;
+                stats.masksDropped++;
             }
         }
 
@@ -321,11 +443,14 @@
         }
 
         const rewrite = (args) => {
-            if (maskedView && args[0] === maskedView) {
+            /* kept for diagnostics, so a swapped MaskedView is still reported
+               under its real name rather than as UnmaskedView */
+            const type = args[0];
+            if (maskedView && type === maskedView) {
                 args[0] = UnmaskedView;
                 stats.maskedViews++;
             }
-            const props = transformProps(args[1]);
+            const props = transformProps(type, args[1]);
             if (props !== args[1]) args[1] = props;
             return args;
         };
@@ -360,6 +485,8 @@
         styleCache = new WeakMap();
 
         sweepRegistry();
+        zeroTokenModule();
+        stats.sweptValues = undoLog.length;
 
         /* Layer 2: anything created from here on */
         unpatches.push(
@@ -412,6 +539,67 @@
         apply();
     }
 
+    /* ── diagnostics ──────────────────────────────────────────────────── */
+
+    /**
+     * Report Discord's design-token radii, if the module is reachable.
+     *
+     * If these are already zero, radius tokens are not what is keeping anything
+     * round, which rules out a whole class of cause.
+     */
+    function probeTokens() {
+        let tokens;
+        try {
+            tokens = metro.findByProps('unsafe_rawColors', 'colors');
+        } catch {
+            return 'tokens module not found';
+        }
+        if (!tokens) return 'tokens module not found';
+
+        const found = [];
+        for (const key of Object.keys(tokens)) {
+            if (!TOKEN_KEYS.has(key)) continue;
+            let value;
+            try {
+                value = tokens[key];
+            } catch {
+                continue;
+            }
+            if (value && typeof value === 'object') {
+                found.push(`${key}={${Object.keys(value)
+                    .map((k) => `${k}:${value[k]}`)
+                    .join(',')}}`);
+            }
+        }
+        return found.length ? found.join(' ') : 'no radius tokens on the tokens module';
+    }
+
+    function buildReport() {
+        const lines = [
+            'system24 unrounding diagnostics',
+            `config: squareMasks=${store.squareMasks} stripElementStyles=${store.stripElementStyles} keepCircles=${store.keepCircles}`,
+            `hooks: ${stats.hooks.join(', ') || 'none'}`,
+            `counts: ${stats.sweptValues} swept / ${stats.styleProps} style props / ${stats.directProps} direct props / ${stats.masksDropped} masks / ${stats.maskedViews} MaskedViews`,
+            `modules swept: ${stats.modules}`,
+            `tokens: ${probeTokens()}`,
+        ];
+
+        if (stats.observed.size === 0) {
+            lines.push(
+                store.recordElements
+                    ? 'observed: nothing yet — open the screen that is still round, then report again'
+                    : 'observed: recording is off'
+            );
+        } else {
+            lines.push(`observed (${stats.observed.size}):`);
+            for (const [name, keys] of stats.observed) {
+                lines.push(`  ${name}: ${[...keys].join(', ')}`);
+            }
+        }
+
+        return lines.join('\n');
+    }
+
     /* ── settings ─────────────────────────────────────────────────────── */
 
     function Settings() {
@@ -451,6 +639,14 @@
                 onValueChange: toggle('keepCircles', 'Circle handling updated'),
             }),
             React.createElement(FormDivider, null),
+            React.createElement(FormSwitchRow, {
+                label: 'Record what looks rounded',
+                subLabel:
+                    'Notes the shape-related props of every element rendered, handled or not. Turn on, open the screen that is still round, then copy the report.',
+                value: store.recordElements,
+                onValueChange: toggle('recordElements', 'Recording updated'),
+            }),
+            React.createElement(FormDivider, null),
             React.createElement(FormRow, {
                 label: 'Re-run now',
                 subLabel: 'Sweeps screens opened since the plugin started.',
@@ -461,16 +657,19 @@
             }),
             React.createElement(FormDivider, null),
             React.createElement(FormRow, {
-                label: 'Show what it hooked',
+                label: 'Copy diagnostics',
                 subLabel:
-                    'If something is still round, this says which mechanisms were found — useful in a bug report.',
+                    'Copies which mechanisms were found, what was changed, and anything recorded — paste it into a bug report.',
                 onPress: () => {
-                    const summary =
-                        `hooks: ${stats.hooks.join(', ') || 'none'} · ` +
-                        `${stats.sweptValues} swept · ${stats.styleProps} style props · ` +
-                        `${stats.masksDropped} masks · ${stats.maskedViews} MaskedViews`;
-                    logger.log(summary);
-                    showToast(summary);
+                    const report = buildReport();
+                    logger.log(report);
+                    try {
+                        clipboard.setString(report);
+                        showToast('Diagnostics copied to clipboard');
+                    } catch (error) {
+                        logger.error('clipboard unavailable', error);
+                        showToast('Could not copy — the report is in the debug log');
+                    }
                 },
             })
         );

@@ -101,12 +101,33 @@ Settings:
 - **Keep circles and pills round** (off) — leaves radii ≥ 100 alone *and* keeps masks intact, so
   avatars stay round. Off by default because system24 squares those too (upstream zeroes
   `--radius-round` as well).
-- **Re-run now** / **Show what it hooked** — the latter reports which mechanisms were actually found
-  (`jsx`, `createElement`, whether MaskedView resolved) plus counts. That's the thing to read first
-  if something is still round.
+- **Record what looks rounded** (off) — notes the shape-related props of every element rendered,
+  handled or not.
+- **Re-run now** — re-sweeps screens opened since startup.
+- **Copy diagnostics** — puts the whole report on the clipboard.
 
-The one case nothing here can reach: if a shape is drawn by a **native** Android drawable rather than
-by React Native, it isn't reachable from JS at all.
+### If something is still round
+
+Guessing at mechanisms is worthless next to knowing which props Discord actually put on the element,
+so the plugin can tell you:
+
+1. Turn on **Record what looks rounded**.
+2. Open the screen that's still round, and scroll it so the element renders.
+3. Come back and hit **Copy diagnostics**.
+
+The report lists which hooks were installed, whether MaskedView resolved, what the design system's
+radius tokens currently are, counts of everything changed, and — per component name — every prop
+whose name suggests a shape. That last section is the useful part: it names the component and the
+exact prop keeping it round.
+
+Deliberate non-fixes, both visible in that report:
+
+- **Ambiguous props are recorded, never changed.** A bare `radius` prop could be a blur or shadow
+  radius, so zeroing it on sight would break unrelated things. Only `borderRadius`, `cornerRadius`,
+  `borderRadii` and Fresco's `roundAsCircle` are changed outright.
+- **Native drawables are unreachable.** If a shape is drawn by Android rather than by React Native —
+  a real possibility for parts of the chat list — no JS plugin can touch it, and the report will show
+  no round-ish props on the element at all.
 
 ## Files
 
